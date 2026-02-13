@@ -144,7 +144,7 @@ Cursor hits /mcp
 
 ## Source
 
-GitHub: **[REPO URL — replace after repo creation]**
+GitHub: [azure-mcp-entra-id-oauth](https://github.com/mario-guerra/azure-mcp-entra-id-oauth)
 
 ## License
 

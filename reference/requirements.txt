@@ -1,0 +1,10 @@
+# Dependencies for the MCP OAuth compatibility layer
+#
+# These are ONLY the dependencies needed for the OAuth compatibility layer
+# and identity middleware. Your MCP server will have its own dependencies
+# (e.g., mcp, fastmcp, etc.) in addition to these.
+
+httpx>=0.28.0               # Async HTTP client for OIDC metadata fetch and token proxy
+starlette>=0.27.0           # ASGI framework (also satisfied by fastapi)
+fastapi>=0.100.0            # Web framework (provides Request, status, JSONResponse)
+email-validator>=2.0.0      # Email validation for identity middleware

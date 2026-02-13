@@ -192,7 +192,7 @@ Note the **secret value** (you'll need it for Easy Auth configuration).
 
 ## 6. Step 2: Implement the OAuth Compatibility Layer
 
-This is the core of the solution. You need a single module (`oauth_metadata.py`) that provides six endpoint factories.
+This is the core of the solution. You need a single module (`oauth_metadata.py`) that provides five endpoint factories.
 
 ### Required Dependencies
 
@@ -391,7 +391,7 @@ Do NOT trust `X-MS-CLIENT-PRINCIPAL-NAME` alone. Require that `X-MS-CLIENT-PRINC
 
 ## 8. Step 4: Wire It All Into the MCP Server
 
-Register all six endpoints with your Starlette/FastAPI app:
+Register all endpoints with your Starlette/FastAPI app:
 
 ```python
 # After creating the Starlette app from FastMCP:

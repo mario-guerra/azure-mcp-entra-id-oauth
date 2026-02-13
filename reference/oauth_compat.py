@@ -2,7 +2,7 @@
 OAuth Compatibility Layer for MCP Servers on Azure with Microsoft Entra ID
 
 This module bridges the gap between the MCP OAuth specification (as implemented
-by Cursor IDE) and Microsoft Entra ID. It provides six endpoint handlers that
+by Cursor IDE) and Microsoft Entra ID. It provides five endpoint handlers that
 you wire into your Starlette/FastAPI application.
 
 Endpoints provided:
@@ -45,9 +45,10 @@ License: MIT
 """
 
 import os
+import time
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import urlencode, parse_qs
 
 import httpx
@@ -180,7 +181,7 @@ def _service_unavailable(message: str) -> JSONResponse:
 
 class OAuthCompatEndpoints:
     """
-    All six OAuth compatibility endpoints in a single class.
+    All five OAuth compatibility endpoints in a single class.
 
     Usage:
         config = OAuthCompatConfig.from_env()
@@ -193,9 +194,15 @@ class OAuthCompatEndpoints:
         app.add_route("/oauth/token", endpoints.token_proxy, methods=["POST"])
     """
 
-    def __init__(self, config: OAuthCompatConfig):
+    # Default cache TTL: 1 hour. OIDC metadata rarely changes, but key rotations
+    # and endpoint updates do happen. 1 hour balances freshness with performance.
+    DEFAULT_CACHE_TTL_SECONDS: float = 3600.0
+
+    def __init__(self, config: OAuthCompatConfig, cache_ttl: float = DEFAULT_CACHE_TTL_SECONDS):
         self.config = config
-        self._oidc_cache: dict = {}
+        self._cache_ttl = cache_ttl
+        # Cache stores (metadata_dict, monotonic_timestamp) tuples
+        self._oidc_cache: dict[str, Tuple[dict, float]] = {}
 
     # -------------------------------------------------------------------------
     # 1. RFC 9728 — Protected Resource Metadata
@@ -247,13 +254,20 @@ class OAuthCompatEndpoints:
 
         issuer_url = f"{self.config.issuer_base_url.rstrip('/')}/{self.config.tenant_id}/v2.0"
 
-        # Fetch and cache OIDC metadata
-        if issuer_url not in self._oidc_cache:
+        # Fetch and cache OIDC metadata with TTL expiration.
+        # Re-fetches when cache is missing or stale to pick up key rotations.
+        cached = self._oidc_cache.get(issuer_url)
+        now = time.monotonic()
+        if cached is None or (now - cached[1]) > self._cache_ttl:
             oidc = await _fetch_oidc_metadata(issuer_url)
             if oidc:
-                self._oidc_cache[issuer_url] = oidc
+                self._oidc_cache[issuer_url] = (oidc, now)
+            elif cached is not None:
+                # Fetch failed but we have stale data — use it rather than returning 503
+                logger.warning("OIDC metadata refresh failed; serving stale cache for %s", issuer_url)
 
-        oidc = self._oidc_cache.get(issuer_url)
+        cached = self._oidc_cache.get(issuer_url)
+        oidc = cached[0] if cached else None
         if not oidc:
             return _service_unavailable("Unable to fetch authorization server metadata.")
 
@@ -294,6 +308,12 @@ class OAuthCompatEndpoints:
 
         All MCP clients get the same Entra ID app registration — this is
         by design (one app per MCP server).
+
+        NOTE: This endpoint has no built-in rate limiting. The client_id it
+        returns is semi-public (required for OAuth flows), but you should
+        add rate limiting at the infrastructure level (e.g., Azure API
+        Management, Container App IP restrictions, or a reverse proxy)
+        to prevent abuse.
         """
         if not self.config.is_configured():
             return _service_unavailable("OAuth is not configured.")
@@ -352,13 +372,25 @@ class OAuthCompatEndpoints:
     # 5. Token Proxy — Scope Rewriter (forwarded POST)
     # -------------------------------------------------------------------------
 
+    # Parameters that are expected in OAuth token exchange requests.
+    # Only these are forwarded to Microsoft to prevent parameter injection.
+    ALLOWED_TOKEN_PARAMS = frozenset({
+        "grant_type",       # authorization_code or refresh_token
+        "code",             # Authorization code from callback
+        "redirect_uri",     # Must match the authorize request
+        "client_id",        # Public client identifier
+        "scope",            # Will be rewritten by this proxy
+        "code_verifier",    # PKCE proof
+        "refresh_token",    # For token refresh flows
+    })
+
     async def token_proxy(self, request: Request) -> JSONResponse:
         """
         POST /oauth/token
 
         Intercepts the token exchange request from Cursor, rewrites the scope,
-        removes the `resource` parameter, and forwards to Microsoft's token
-        endpoint. Returns Microsoft's response as-is.
+        removes the `resource` parameter, filters to an allowlist of expected
+        parameters, and forwards to Microsoft's token endpoint.
         """
         body = await request.body()
         params = parse_qs(body.decode(), keep_blank_values=True)
@@ -369,6 +401,9 @@ class OAuthCompatEndpoints:
 
         flat.pop("resource", None)
 
+        # Only forward expected OAuth parameters to Microsoft
+        flat = {k: v for k, v in flat.items() if k in self.ALLOWED_TOKEN_PARAMS}
+
         ms_token = (
             f"{self.config.issuer_base_url.rstrip('/')}"
             f"/{self.config.tenant_id}/oauth2/v2.0/token"
@@ -376,15 +411,36 @@ class OAuthCompatEndpoints:
 
         logger.info("Token proxy: scope=%s", flat.get("scope", ""))
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                ms_token,
-                data=flat,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    ms_token,
+                    data=flat,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+        except httpx.HTTPError as e:
+            logger.error("Token proxy: upstream request failed: %s", e)
+            return JSONResponse(
+                status_code=502,
+                content={"error": "bad_gateway", "message": "Failed to reach Microsoft token endpoint."},
+                media_type="application/json",
             )
+
+        # Microsoft may return non-JSON error responses (HTML 500, rate-limit pages, etc.)
+        try:
+            content = response.json()
+        except Exception:
+            logger.error(
+                "Token proxy: non-JSON response from Microsoft (status %d): %s",
+                response.status_code, response.text[:200],
+            )
+            content = {
+                "error": "upstream_error",
+                "message": "Microsoft token endpoint returned a non-JSON response.",
+            }
 
         return JSONResponse(
             status_code=response.status_code,
-            content=response.json(),
+            content=content,
             media_type="application/json",
         )

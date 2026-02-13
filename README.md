@@ -14,7 +14,7 @@ The MCP specification requires OAuth support via RFC 8414, RFC 7591, and RFC 870
 ## What's In This Repo
 
 ```
-azure-mcp-entra-id-oauth/
+docs/
 ├── README.md                          ← You are here
 ├── azure-mcp-oauth-guide.md           ← Step-by-step deployment guide
 ├── lessons-learned.md                 ← Gotchas, decision records, debugging playbook
@@ -141,6 +141,10 @@ Cursor hits /mcp
   → Easy Auth validates token, injects X-MS-CLIENT-PRINCIPAL headers
   → Your middleware extracts user identity, request proceeds
 ```
+
+## Source
+
+GitHub: **[REPO URL — replace after repo creation]**
 
 ## License
 

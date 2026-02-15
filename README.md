@@ -89,7 +89,8 @@ az containerapp update \
   --set-env-vars \
     "OAUTH_RESOURCE_URL=https://<app>.azurecontainerapps.io" \
     "OAUTH_TENANT_ID=<tenant-id>" \
-    "OAUTH_CLIENT_ID=<client-id>"
+    "OAUTH_CLIENT_ID=<client-id>" \
+    "OAUTH_ALLOWED_HOSTS=login.microsoftonline.com"
 ```
 
 ### 4. Configure Cursor
@@ -142,7 +143,7 @@ If you are an AI agent tasked with adding Entra ID OAuth to an MCP server, read 
 This implementation follows a **Deny by Default** approach tailored for MCP:
 
 - **Strict Normalization**: Uses `posixpath.normpath` and leading-slash collapsing to block path traversal (e.g., `//mcp`).
-- **SSRF Protection**: Strictly validates the upstream Microsoft host URL.
+- **SSRF Protection**: Strictly validates the upstream host. Configurable via `OAUTH_ALLOWED_HOSTS` for sovereign clouds (defaults to `login.microsoftonline.com`).
 - **Client ID Enforcement**: Verifies the `client_id` in the token proxy to prevent impersonation.
 - **Production Isolation**: Development bypass logic is strictly isolated in `dev_middleware.py`.
 

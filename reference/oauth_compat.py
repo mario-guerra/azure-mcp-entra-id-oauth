@@ -48,7 +48,7 @@ import os
 import time
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any, Set
 from urllib.parse import urlencode, parse_qs, urlparse
 
 import httpx
@@ -74,6 +74,7 @@ class OAuthCompatConfig:
     client_id: str             # Entra ID client/application ID
     scopes: List[str] = field(default_factory=lambda: ["access_as_user"])
     issuer_base_url: str = "https://login.microsoftonline.com"
+    allowed_hosts: Set[str] = field(default_factory=lambda: {"login.microsoftonline.com"})
 
     def is_configured(self) -> bool:
         """Check if all required fields are non-empty."""
@@ -98,7 +99,16 @@ class OAuthCompatConfig:
         scopes_str = os.environ.get("OAUTH_SCOPES", "access_as_user").strip()
         scopes = [s.strip() for s in scopes_str.split(",") if s.strip()] or ["access_as_user"]
 
-        config = cls(
+        # Custom host allowlist (comma-separated, default: login.microsoftonline.com)
+        allowed_hosts_str = os.environ.get("OAUTH_ALLOWED_HOSTS", "login.microsoftonline.com").strip()
+        allowed_hosts = {h.strip() for h in allowed_hosts_str.split(",") if h.strip()}
+        
+        # Ensure the netloc of the issuer_base_url is also allowed
+        issuer_netloc = urlparse(os.environ.get("OAUTH_ISSUER_BASE_URL", "https://login.microsoftonline.com")).netloc
+        if issuer_netloc:
+            allowed_hosts.add(issuer_netloc)
+
+        return cls(
             resource_url=os.environ.get("OAUTH_RESOURCE_URL", "").strip(),
             tenant_id=os.environ.get("OAUTH_TENANT_ID", "").strip(),
             client_id=os.environ.get("OAUTH_CLIENT_ID", "").strip(),
@@ -106,6 +116,7 @@ class OAuthCompatConfig:
             issuer_base_url=os.environ.get(
                 "OAUTH_ISSUER_BASE_URL", "https://login.microsoftonline.com"
             ).strip(),
+            allowed_hosts=allowed_hosts,
         )
 
         if config.is_configured():
@@ -416,8 +427,9 @@ class OAuthCompatEndpoints:
             
             # Security: Host validation for upstream call
             parsed_url = urlparse(ms_token_url)
-            if parsed_url.netloc not in ("login.microsoftonline.com",):
-                logger.error("Security: Untrusted issuer host detected: %s", parsed_url.netloc)
+            if parsed_url.netloc not in self.config.allowed_hosts:
+                logger.error("Security: Untrusted issuer host detected: %s. Allowed hosts: %s", 
+                             parsed_url.netloc, self.config.allowed_hosts)
                 return JSONResponse(status_code=400, content={"error": "invalid_request", "message": "Untrusted issuer host."})
 
             async with httpx.AsyncClient(timeout=10.0) as client:

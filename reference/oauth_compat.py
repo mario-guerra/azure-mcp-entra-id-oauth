@@ -157,14 +157,22 @@ def _qualify_scopes(scopes: List[str], client_id: str) -> List[str]:
     return rewrite_mcp_scopes(" ".join(scopes), client_id).split()
 
 
-async def _fetch_oidc_metadata(issuer_url: str) -> Optional[dict]:
+async def _fetch_oidc_metadata(issuer_url: str, allowed_hosts: Set[str]) -> Optional[dict]:
     """
     Fetch OpenID Connect discovery metadata from Microsoft Entra ID.
 
     Args:
         issuer_url: e.g., https://login.microsoftonline.com/<tenant>/v2.0
+        allowed_hosts: Set of trusted hosts to prevent SSRF
     """
     oidc_url = f"{issuer_url.rstrip('/')}/.well-known/openid-configuration"
+    
+    # Security: Host validation to prevent SSRF
+    parsed_url = urlparse(oidc_url)
+    if parsed_url.netloc not in allowed_hosts:
+        logger.error("Security: SSRF attempt blocked. Untrusted OIDC issuer host: %s", parsed_url.netloc)
+        return None
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.get(oidc_url)
@@ -270,7 +278,7 @@ class OAuthCompatEndpoints:
         cached = self._oidc_cache.get(issuer_url)
         now = time.monotonic()
         if cached is None or (now - cached[1]) > self._cache_ttl:
-            oidc = await _fetch_oidc_metadata(issuer_url)
+            oidc = await _fetch_oidc_metadata(issuer_url, self.config.allowed_hosts)
             if oidc:
                 self._oidc_cache[issuer_url] = (oidc, now)
             elif cached is not None:
@@ -374,6 +382,16 @@ class OAuthCompatEndpoints:
             f"{self.config.issuer_base_url.rstrip('/')}"
             f"/{self.config.tenant_id}/oauth2/v2.0/authorize"
         )
+
+        # Security: Host validation to prevent Open-Redirect
+        parsed_url = urlparse(ms_authorize)
+        if parsed_url.netloc not in self.config.allowed_hosts:
+            logger.error("Security: Open-Redirect blocked. Untrusted issuer host: %s", parsed_url.netloc)
+            return JSONResponse(
+                status_code=400, 
+                content={"error": "invalid_request", "message": "Untrusted issuer host."}
+            )
+
         redirect_url = f"{ms_authorize}?{urlencode(params)}"
 
         logger.info("Authorize proxy: scope=%s", params.get("scope", ""))

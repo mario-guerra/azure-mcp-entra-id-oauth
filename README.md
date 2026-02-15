@@ -143,7 +143,7 @@ If you are an AI agent tasked with adding Entra ID OAuth to an MCP server, read 
 This implementation follows a **Deny by Default** approach tailored for MCP:
 
 - **Strict Normalization**: Uses `posixpath.normpath` and leading-slash collapsing to block path traversal (e.g., `//mcp`).
-- **SSRF Protection**: Strictly validates the upstream host. Configurable via `OAUTH_ALLOWED_HOSTS` for sovereign clouds (defaults to `login.microsoftonline.com`).
+- **SSRF & Open-Redirect Protection**: All upstream calls (metadata discovery and token exchange) and browser redirects (authorization) are strictly validated against a host allowlist. Configurable via `OAUTH_ALLOWED_HOSTS`.
 - **Client ID Enforcement**: Verifies the `client_id` in the token proxy to prevent impersonation.
 - **Production Isolation**: Development bypass logic is strictly isolated in `dev_middleware.py`.
 

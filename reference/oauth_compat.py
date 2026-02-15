@@ -108,7 +108,7 @@ class OAuthCompatConfig:
         if issuer_netloc:
             allowed_hosts.add(issuer_netloc)
 
-        return cls(
+        config = cls(
             resource_url=os.environ.get("OAUTH_RESOURCE_URL", "").strip(),
             tenant_id=os.environ.get("OAUTH_TENANT_ID", "").strip(),
             client_id=os.environ.get("OAUTH_CLIENT_ID", "").strip(),

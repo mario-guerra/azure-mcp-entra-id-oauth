@@ -48,8 +48,8 @@ import os
 import time
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-from urllib.parse import urlencode, parse_qs
+from typing import List, Optional, Tuple, Dict, Any
+from urllib.parse import urlencode, parse_qs, urlparse
 
 import httpx
 from starlette.requests import Request
@@ -123,27 +123,27 @@ class OAuthCompatConfig:
 # Helpers
 # =============================================================================
 
-def _qualify_scopes(scopes: List[str], client_id: str) -> List[str]:
+def rewrite_mcp_scopes(scope_string: str, client_id: str) -> str:
     """
-    Convert short-form scopes to Microsoft Entra ID fully qualified format.
-
+    Centralized scope rewriting logic.
     Microsoft v2.0 requires custom scopes in the format: api://<client-id>/<scope>
-    Standard OIDC scopes (openid, profile, email, offline_access) are left as-is.
+    Standard OIDC scopes are left as-is.
     """
+    scopes = scope_string.split()
     result = []
-    for scope in scopes:
-        if scope in ("openid", "profile", "email", "offline_access"):
-            result.append(scope)
-        elif scope.startswith("api://"):
-            result.append(scope)
+    for s in scopes:
+        if s in ("openid", "profile", "email", "offline_access"):
+            result.append(s)
+        elif s.startswith("api://"):
+            result.append(s)
         else:
-            result.append(f"api://{client_id}/{scope}")
-    return result
+            result.append(f"api://{client_id}/{s}")
+    return " ".join(result)
 
 
-def _rewrite_scope_param(scope_string: str, client_id: str) -> str:
-    """Rewrite a space-separated scope string to fully qualified format."""
-    return " ".join(_qualify_scopes(scope_string.split(), client_id))
+def _qualify_scopes(scopes: List[str], client_id: str) -> List[str]:
+    """Convert short-form scopes to fully qualified format (uses centralized logic)."""
+    return rewrite_mcp_scopes(" ".join(scopes), client_id).split()
 
 
 async def _fetch_oidc_metadata(issuer_url: str) -> Optional[dict]:
@@ -355,7 +355,7 @@ class OAuthCompatEndpoints:
         params = dict(request.query_params)
 
         if "scope" in params:
-            params["scope"] = _rewrite_scope_param(params["scope"], self.config.client_id)
+            params["scope"] = rewrite_mcp_scopes(params["scope"], self.config.client_id)
 
         params.pop("resource", None)
 
@@ -387,60 +387,52 @@ class OAuthCompatEndpoints:
     async def token_proxy(self, request: Request) -> JSONResponse:
         """
         POST /oauth/token
-
-        Intercepts the token exchange request from Cursor, rewrites the scope,
-        removes the `resource` parameter, filters to an allowlist of expected
-        parameters, and forwards to Microsoft's token endpoint.
+        
+        Intercepts the token exchange request, rewrites scope, verifies client_id,
+        and forwards to Microsoft with host validation and audit logging.
         """
-        body = await request.body()
-        params = parse_qs(body.decode(), keep_blank_values=True)
-        flat = {k: v[0] if len(v) == 1 else v for k, v in params.items()}
-
-        if "scope" in flat:
-            flat["scope"] = _rewrite_scope_param(flat["scope"], self.config.client_id)
-
-        flat.pop("resource", None)
-
-        # Only forward expected OAuth parameters to Microsoft
-        flat = {k: v for k, v in flat.items() if k in self.ALLOWED_TOKEN_PARAMS}
-
-        ms_token = (
-            f"{self.config.issuer_base_url.rstrip('/')}"
-            f"/{self.config.tenant_id}/oauth2/v2.0/token"
-        )
-
-        logger.info("Token proxy: scope=%s", flat.get("scope", ""))
-
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            body = await request.body()
+            params = parse_qs(body.decode(), keep_blank_values=True)
+            flat = {k: v[0] if len(v) == 1 else v for k, v in params.items()}
+
+            # Audit: Token request audit log
+            logger.info("Audit: Token exchange request for client_id: %s", flat.get("client_id"))
+
+            # Security: Verify client_id matches configuration
+            if flat.get("client_id") != self.config.client_id:
+                logger.warning("Security: Blocked token proxy for unauthorized client_id: %s", flat.get("client_id"))
+                return JSONResponse(status_code=400, content={"error": "invalid_client"})
+
+            if "scope" in flat:
+                flat["scope"] = rewrite_mcp_scopes(flat["scope"], self.config.client_id)
+
+            flat.pop("resource", None)
+
+            # Only forward allowed OAuth parameters
+            flat = {k: v for k, v in flat.items() if k in self.ALLOWED_TOKEN_PARAMS}
+
+            ms_token_url = f"{self.config.issuer_base_url.rstrip('/')}/{self.config.tenant_id}/oauth2/v2.0/token"
+            
+            # Security: Host validation for upstream call
+            parsed_url = urlparse(ms_token_url)
+            if parsed_url.netloc not in ("login.microsoftonline.com",):
+                logger.error("Security: Untrusted issuer host detected: %s", parsed_url.netloc)
+                return JSONResponse(status_code=400, content={"error": "invalid_request", "message": "Untrusted issuer host."})
+
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.post(
-                    ms_token,
+                    ms_token_url,
                     data=flat,
                     headers={"Content-Type": "application/x-www-form-urlencoded"},
                 )
-        except httpx.HTTPError as e:
-            logger.error("Token proxy: upstream request failed: %s", e)
-            return JSONResponse(
-                status_code=502,
-                content={"error": "bad_gateway", "message": "Failed to reach Microsoft token endpoint."},
-                media_type="application/json",
-            )
+                response.raise_for_status()
+                
+            return JSONResponse(status_code=response.status_code, content=response.json())
 
-        # Microsoft may return non-JSON error responses (HTML 500, rate-limit pages, etc.)
-        try:
-            content = response.json()
-        except Exception:
-            logger.error(
-                "Token proxy: non-JSON response from Microsoft (status %d): %s",
-                response.status_code, response.text[:200],
-            )
-            content = {
-                "error": "upstream_error",
-                "message": "Microsoft token endpoint returned a non-JSON response.",
-            }
-
-        return JSONResponse(
-            status_code=response.status_code,
-            content=content,
-            media_type="application/json",
-        )
+        except httpx.HTTPStatusError as e:
+            logger.error("Audit: Upstream token error %d: %s", e.response.status_code, e.response.text)
+            return JSONResponse(status_code=e.response.status_code, content=e.response.json() if "application/json" in e.response.headers.get("Content-Type", "") else {"error": "upstream_error"})
+        except Exception as e:
+            logger.error("Audit: Internal error in token_proxy: %s", e)
+            return JSONResponse(status_code=500, content={"error": "server_error"})

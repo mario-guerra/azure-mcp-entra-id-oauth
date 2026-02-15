@@ -55,18 +55,22 @@ from identity_middleware import IdentityMiddleware
 # Get the Starlette app from your FastMCP server
 app = mcp.streamable_http_app()
 
-# Add middleware
-app.add_middleware(IdentityMiddleware)
+# Add middleware dynamically based on environment
+import os
+from identity_middleware import IdentityMiddleware
+
+app = mcp.streamable_http_app()
+
+if os.environ.get("RUNNING_IN_PRODUCTION") == "true":
+    app.add_middleware(IdentityMiddleware)
+else:
+    from dev_middleware import DevIdentityMiddleware
+    app.add_middleware(DevIdentityMiddleware)
 
 # Add OAuth endpoints
 config = OAuthCompatConfig.from_env()
 oauth = OAuthCompatEndpoints(config)
-
-app.add_route("/.well-known/oauth-protected-resource", oauth.protected_resource, methods=["GET"])
-app.add_route("/.well-known/oauth-authorization-server", oauth.authorization_server, methods=["GET"])
-app.add_route("/oauth/register", oauth.client_registration, methods=["POST"])
-app.add_route("/oauth/authorize", oauth.authorize_proxy, methods=["GET"])
-app.add_route("/oauth/token", oauth.token_proxy, methods=["POST"])
+# ... add_route calls ...
 ```
 
 See [reference/example_server.py](reference/example_server.py) for a complete minimal example.
@@ -127,19 +131,61 @@ If you are an AI agent tasked with adding Entra ID OAuth to an MCP server, read 
 
 ## How It Works (30-Second Version)
 
-```
-Cursor hits /mcp
-  → Your middleware returns 401 + WWW-Authenticate header
-  → Cursor fetches /.well-known/oauth-protected-resource (your endpoint)
-  → Cursor fetches /.well-known/oauth-authorization-server (your proxy of Microsoft's OIDC)
-  → Cursor POSTs /oauth/register (your mock — returns your pre-configured client_id)
-  → Cursor redirects to /oauth/authorize (your proxy — rewrites scope, 302s to Microsoft)
-  → User signs in at Microsoft
-  → Microsoft redirects back to Cursor with auth code
-  → Cursor POSTs /oauth/token (your proxy — rewrites scope, forwards to Microsoft)
-  → Cursor gets access token, calls /mcp with Bearer token
-  → Easy Auth validates token, injects X-MS-CLIENT-PRINCIPAL headers
-  → Your middleware extracts user identity, request proceeds
+1.  **Discovery**: Your middleware returns 401 + metadata URL. Cursor fetches discovery docs.
+2.  **Registration**: Cursor registers and gets a `client_id`.
+3.  **Authorize**: Cursor redirects to `/oauth/authorize`. Your proxy rewrites scopes and 302s to Microsoft.
+4.  **Token**: After user login, Cursor swaps the code for a token at `/oauth/token`. Your proxy validates the client and rewrites scopes.
+5.  **MCP Call**: Cursor calls `/mcp`. Azure validates the token; your middleware validates the principal and path before calling the tool.
+
+## Security Hardening
+
+This implementation follows a **Deny by Default** approach tailored for MCP:
+
+- **Strict Normalization**: Uses `posixpath.normpath` and leading-slash collapsing to block path traversal (e.g., `//mcp`).
+- **SSRF Protection**: Strictly validates the upstream Microsoft host URL.
+- **Client ID Enforcement**: Verifies the `client_id` in the token proxy to prevent impersonation.
+- **Production Isolation**: Development bypass logic is strictly isolated in `dev_middleware.py`.
+
+## Data Flow Diagram
+
+The following diagram illustrates the interaction between Cursor, the Compatibility Layer, and Azure Entra ID.
+
+```mermaid
+sequenceDiagram
+    participant C as Cursor IDE
+    participant P as OAuth Compatibility Layer (Proxy)
+    participant M as Identity Middleware
+    participant E as Azure Entra ID (Microsoft)
+    participant A as MCP App (Tools)
+
+    Note over C, A: 1. OAuth Discovery & Registration
+    C->>P: GET /.well-known/oauth-protected-resource
+    P-->>C: 401 Unauthorized + metadata URL
+    C->>P: GET /.well-known/oauth-authorization-server
+    P-->>C: OIDC Metadata (proxied from Microsoft)
+    C->>P: POST /oauth/register
+    P-->>C: 201 Created + client_id
+
+    Note over C, A: 2. Authorization Flow
+    C->>P: GET /oauth/authorize?scope=...
+    P->>C: 302 Redirect to Microsoft (with rewritten scope)
+    C->>E: User Interaction / Login
+    E-->>C: 302 Redirect back with Code
+
+    Note over C, A: 3. Token Exchange
+    C->>P: POST /oauth/token (code + client_id)
+    P->>P: Validate client_id & Rewrite scope
+    P->>E: POST /v2.0/token (Forwarded)
+    E-->>P: Access Token + ID Token
+    P-->>C: Access Token
+
+    Note over C, A: 4. Secure Tool Call
+    C->>M: POST /mcp (Bearer Token)
+    Note right of M: Azure App Service validates Token
+    M->>M: Normalize Path & Verify Identity
+    M->>A: Call Tool (Context: authenticated user)
+    A-->>M: Tool Result
+    M-->>C: JSON Response
 ```
 
 ## Source

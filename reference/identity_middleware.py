@@ -30,6 +30,8 @@ License: MIT
 """
 
 import os
+import re
+import posixpath
 import base64
 import json
 import logging
@@ -129,26 +131,21 @@ class IdentityMiddleware(BaseHTTPMiddleware):
     PRINCIPAL_NAME_HEADER = "X-MS-CLIENT-PRINCIPAL-NAME"
     PRINCIPAL_ID_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"
 
-    # Paths that don't require authentication
-    EXCLUDED_PATHS: Set[str] = {"/health", "/healthz", "/"}
-    EXCLUDED_PREFIXES: Set[str] = {"/.well-known/", "/oauth/"}
+    # Strict route matching
+    PROTECTED_REGEX = re.compile(r"^/mcp(/.*)?$")
+    PUBLIC_PATHS: Set[str] = {"/health", "/healthz", "/"}
+    PUBLIC_PREFIXES: Set[str] = {"/.well-known/", "/oauth/"}
 
-    def __init__(self, app, dev_bypass: bool = False):
+    def __init__(self, app):
         """
         Args:
             app: The Starlette/FastAPI application
-            dev_bypass: If True AND RUNNING_IN_PRODUCTION is not set, accept
-                        X-User-Email header for local development. NEVER enable
-                        this in production.
         """
         super().__init__(app)
-        self._dev_bypass = dev_bypass and not os.environ.get("RUNNING_IN_PRODUCTION")
-        if self._dev_bypass:
-            logger.warning("DEV BYPASS ENABLED — X-User-Email header will be accepted")
 
     async def dispatch(self, request: Request, call_next: Callable):
-        # Skip auth for excluded paths
-        if self._is_excluded(request.url.path):
+        # Skip auth for public paths
+        if not self._is_protected(request.url.path):
             return await call_next(request)
 
         # Try to extract identity
@@ -179,11 +176,27 @@ class IdentityMiddleware(BaseHTTPMiddleware):
         finally:
             _user_identity.set(None)
 
-    def _is_excluded(self, path: str) -> bool:
-        """Check if the path is excluded from authentication."""
-        if path in self.EXCLUDED_PATHS:
-            return True
-        return any(path.startswith(prefix) for prefix in self.EXCLUDED_PREFIXES)
+    def _is_protected(self, path: str) -> bool:
+        """
+        Check if the path is protected and requires authentication.
+        Uses normalization to prevent traversal-based bypasses.
+        
+        Security: This uses a "Deny by Default" approach. All routes are 
+        protected unless explicitly listed in PUBLIC_PATHS or PUBLIC_PREFIXES.
+        """
+        normalized = posixpath.normpath(path)
+        # Fix for some POSIX normpath behavior that preserves //
+        while normalized.startswith("//"):
+            normalized = "/" + normalized.lstrip("/")
+        if normalized == ".": normalized = "/"
+        if not normalized.startswith("/"): normalized = "/" + normalized
+
+        if normalized in self.PUBLIC_PATHS:
+            return False
+        if any(normalized.startswith(prefix) for prefix in self.PUBLIC_PREFIXES):
+            return False
+            
+        return True
 
     def _extract_identity(self, request: Request) -> Optional[UserIdentity]:
         """
@@ -193,31 +206,19 @@ class IdentityMiddleware(BaseHTTPMiddleware):
         base64-encoded JSON. This header can only be set by Easy Auth — it
         cannot be spoofed by clients. Do NOT trust X-MS-CLIENT-PRINCIPAL-NAME
         alone.
-
-        Falls back to X-User-Email if dev bypass is enabled (development only).
         """
-        headers = request.headers
-
-        # --- Easy Auth extraction ---
-        principal_b64 = headers.get(self.PRINCIPAL_HEADER)
+        principal_b64 = request.headers.get(self.PRINCIPAL_HEADER)
         if principal_b64:
             claims = self._decode_principal(principal_b64)
             if claims is not None:
-                email = headers.get(self.PRINCIPAL_NAME_HEADER, "").strip()
+                email = request.headers.get(self.PRINCIPAL_NAME_HEADER, "").strip()
                 if email:
                     return UserIdentity(
                         email=email,
-                        object_id=(headers.get(self.PRINCIPAL_ID_HEADER) or "").strip() or None,
+                        object_id=(request.headers.get(self.PRINCIPAL_ID_HEADER) or "").strip() or None,
                         name=self._extract_name(claims),
                         raw_claims=claims,
                     )
-
-        # --- Dev bypass (local development only) ---
-        if self._dev_bypass:
-            email = headers.get("X-User-Email", "").strip()
-            if email and self._is_valid_email(email):
-                logger.warning("DEV BYPASS: Accepting X-User-Email for %s", email)
-                return UserIdentity(email=email)
 
         return None
 

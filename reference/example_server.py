@@ -21,6 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from oauth_compat import OAuthCompatConfig, OAuthCompatEndpoints
+import os
 from identity_middleware import IdentityMiddleware, get_user_email
 
 # =============================================================================
@@ -48,7 +49,15 @@ app = mcp.streamable_http_app()
 # 3. Add identity middleware (MUST be added before routes)
 # =============================================================================
 
-app.add_middleware(IdentityMiddleware, dev_bypass=False)
+# Production checks
+IS_PROD = os.environ.get("RUNNING_IN_PRODUCTION") == "true"
+
+if IS_PROD:
+    app.add_middleware(IdentityMiddleware)
+else:
+    # Use development middleware with bypass for local testing
+    from dev_middleware import DevIdentityMiddleware
+    app.add_middleware(DevIdentityMiddleware)
 
 
 # =============================================================================
